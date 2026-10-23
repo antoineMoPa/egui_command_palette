@@ -1,0 +1,12 @@
+[package]
+name = "egui_command_palette"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "A reusable Moon-style command palette for egui applications"
+license = "MIT"
+repository = "https://github.com/antoineMoPa/egui_command_palette"
+readme = "README.md"
+
+[dependencies]
+egui = "0.36"
