@@ -252,6 +252,10 @@ impl CommandPalette {
                     // kept in view when the keyboard moves it; a pointer over a row is
                     // already looking at it.
                     let keep_highlight_in_view = move_down || move_up || retyped;
+                    // A row takes the highlight from the pointer only when it moved onto it:
+                    // a pointer left resting over the list would otherwise take it back from
+                    // the first row on every key typed, a frame after it was drawn there.
+                    let pointer_moved = ui.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
                     let height = rows_height(
                         rows.len(),
                         self.style.row_height,
@@ -279,7 +283,7 @@ impl CommandPalette {
                                 if response.clicked() {
                                     chosen = Some(index);
                                 }
-                                if response.hovered() {
+                                if response.hovered() && pointer_moved {
                                     self.highlighted = index;
                                 }
                             }
