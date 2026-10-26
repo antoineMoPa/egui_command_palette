@@ -150,6 +150,7 @@ impl CommandPalette {
                 title: commands[*index].title.clone(),
                 description: commands[*index].description.clone(),
                 shortcut: commands[*index].shortcut.clone(),
+                title_color: None,
             })
             .collect();
         let view = View {

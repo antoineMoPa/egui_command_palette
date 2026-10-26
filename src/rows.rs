@@ -19,6 +19,8 @@ pub struct Row {
     pub title: String,
     pub description: String,
     pub shortcut: String,
+    /// The title's colour, for a row set apart from the others. `None` is the style's text.
+    pub title_color: Option<Color32>,
 }
 
 /// Which end of a text is kept when it is wider than the room it has.
@@ -116,16 +118,17 @@ pub(crate) fn draw_row(
             );
             text_width -= shortcut.width() + ROW_PADDING;
         }
+        let title_color = row.title_color.unwrap_or(style.text);
         let title = cut_to_width(
             ui.painter(),
             &row.title,
             egui::FontId::proportional(style.title_size),
-            style.text,
+            title_color,
             text_width,
             Kept::Start,
         );
         ui.painter()
-            .galley(rect.min + vec2(ROW_PADDING, 5.0), title, style.text);
+            .galley(rect.min + vec2(ROW_PADDING, 5.0), title, title_color);
         let description = cut_to_width(
             ui.painter(),
             &row.description,
