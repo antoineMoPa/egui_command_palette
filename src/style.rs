@@ -14,8 +14,12 @@ pub struct PaletteStyle {
     pub row_height: f32,
     pub title_size: f32,
     pub detail_size: f32,
+    /// How far under the top of a row its title starts.
+    pub title_top: f32,
     /// How far under the top of a row its second line starts.
     pub detail_top: f32,
+    /// How tall a section's header is, the room above its label included.
+    pub header_height: f32,
 }
 
 impl Default for PaletteStyle {
@@ -31,7 +35,9 @@ impl Default for PaletteStyle {
             row_height: 42.0,
             title_size: 14.0,
             detail_size: 11.0,
+            title_top: 5.0,
             detail_top: 23.0,
+            header_height: 30.0,
         }
     }
 }

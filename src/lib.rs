@@ -1,16 +1,31 @@
 //! A compact, on-demand command palette following Moon's interaction model.
 
+mod history;
+mod output;
 mod rows;
+mod sections;
 mod style;
 
-use egui::{vec2, Align2, CornerRadius, Key, RichText, Stroke};
+use egui::{vec2, Align2, CornerRadius, Key, Modifiers, RichText, Stroke};
 
-use rows::{draw_row, rows_height};
+use rows::draw_row;
+use sections::{draw_header, draw_placeholder, sections_height};
 
-pub use rows::{cut_to_width, paint_highlight, Kept, Row};
+pub use history::HistoryBox;
+pub use output::{OutputBox, OutputLine};
+pub use rows::{cut_to_width, paint_highlight, Aside, Choice, Kept, Row};
+pub use sections::{Section, SectionHeader};
 pub use style::PaletteStyle;
 
 const ROWS_HEIGHT_OF_SCREEN: f32 = 0.55;
+
+/// How far down the window the palette's top is: low enough to leave room for a history box
+/// above it - see [`CommandPalette::show_history`] - so the palette is in the same place
+/// with or without one.
+const TOP_OF_SCREEN: f32 = 0.34;
+
+/// The gap between the label at the start of the query line and what is typed after it.
+const LABEL_GAP: f32 = 6.0;
 
 /// The gap between the query line's edge and what is typed in it.
 const LINE_PADDING: i8 = 7;
@@ -31,8 +46,12 @@ pub struct View<'a> {
     pub empty: &'a str,
     /// A small note under the rows.
     pub footnote: Option<&'a str>,
-    /// Which end of a row's second line is kept when it is too long for the row.
-    pub description_kept: Kept,
+    /// Written small in the accent colour at the start of the query line, before what is
+    /// typed: what the line is typing into, when that is not the list under it.
+    pub label: Option<&'a str>,
+    /// Whether the row the keyboard is on is shown: it is not while the keyboard is in
+    /// another list, the history box's.
+    pub highlight_shown: bool,
 }
 
 /// Something drawn on the query line and under it: a switch at the end of the line, a box
@@ -53,6 +72,21 @@ impl LineAccessory for () {
     fn show(&mut self, _ui: &mut egui::Ui, _line: egui::Rect) {}
 }
 
+/// What was done to the list on one frame of [`CommandPalette::show_sections`].
+#[derive(Default)]
+pub struct Shown {
+    /// The row run, by its place among the rows of every section.
+    pub chosen: Option<usize>,
+    /// The section whose header's right side was clicked, by its place in the list.
+    pub more_clicked: Option<usize>,
+    /// A row's choice picked with ← or →: the row's place among the rows of every section,
+    /// and the choice's among the row's - see [`Row::choices`]. The caller keeps it, and
+    /// lists the row with it picked from the next frame on, which is asked for.
+    pub picked: Option<(usize, usize)>,
+    /// A row's choice clicked, which runs the row with it, the same way.
+    pub choice_clicked: Option<(usize, usize)>,
+}
+
 pub struct CommandPalette {
     open: bool,
     query: String,
@@ -60,7 +94,14 @@ pub struct CommandPalette {
     highlight_query: String,
     rect: Option<egui::Rect>,
     select_query: bool,
+    /// Set by [`CommandPalette::set_query`], for the next frame to put the caret after it.
+    caret_to_end: bool,
     style: PaletteStyle,
+    /// The boxes drawn with the palette since it was last drawn - the history box, the output
+    /// box: a press inside one is not a press away from the palette.
+    beside: Vec<egui::Rect>,
+    /// The row the history box last kept in view - see [`CommandPalette::show_history`].
+    history_in_view: Option<usize>,
 }
 
 impl Default for CommandPalette {
@@ -72,7 +113,10 @@ impl Default for CommandPalette {
             highlight_query: String::new(),
             rect: None,
             select_query: false,
+            caret_to_end: false,
             style: PaletteStyle::default(),
+            beside: Vec::new(),
+            history_in_view: None,
         }
     }
 }
@@ -86,6 +130,8 @@ impl CommandPalette {
         self.highlight_query.clear();
         self.rect = None;
         self.select_query = false;
+        self.beside.clear();
+        self.history_in_view = None;
     }
 
     /// Open it on a query to type over: it is selected, so the first key typed replaces it.
@@ -101,6 +147,25 @@ impl CommandPalette {
     pub fn dismiss(&mut self) {
         self.open = false;
         self.rect = None;
+        self.beside.clear();
+    }
+
+    /// Put `query` on the line in place of what is typed, with the caret at its end, as if it
+    /// had been typed.
+    pub fn set_query(&mut self, query: &str) {
+        self.query = query.to_string();
+        self.caret_to_end = true;
+    }
+
+    /// Keep it open after a row was run - see [`Row::stays_open`] - or open it again, with
+    /// what is typed and the row the keyboard is on as they were.
+    pub fn keep_open(&mut self) {
+        self.open = true;
+    }
+
+    /// Note a box drawn with the palette this frame - see `beside`.
+    fn note_beside(&mut self, rect: egui::Rect) {
+        self.beside.push(rect);
     }
 
     pub fn is_open(&self) -> bool {
@@ -125,6 +190,13 @@ impl CommandPalette {
         self.highlighted = 0;
     }
 
+    /// Put the highlight on the row at `index` among the rows about to be shown: the same
+    /// row as before, which the rows arriving above it have moved down. Typing since still
+    /// puts it back on the first row.
+    pub fn highlight(&mut self, index: usize) {
+        self.highlighted = index;
+    }
+
     pub fn style_mut(&mut self) -> &mut PaletteStyle {
         &mut self.style
     }
@@ -134,7 +206,15 @@ impl CommandPalette {
     /// exists, so a palette still on screen would take it straight back off whatever was just
     /// clicked.
     pub fn dismissal_requested(&self, ctx: &egui::Context) -> bool {
-        pressed_outside(ctx, self.rect) || ctx.input_mut(|input| input.key_pressed(Key::Escape))
+        let pressed_beside = ctx.input(|input| {
+            input.pointer.any_pressed()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|at| self.beside.iter().any(|rect| rect.contains(at)))
+        });
+        (pressed_outside(ctx, self.rect) && !pressed_beside)
+            || ctx.input_mut(|input| input.key_pressed(Key::Escape))
     }
 
     /// The same as [`CommandPalette::show_rows`] over `commands` whose title or description
@@ -150,35 +230,60 @@ impl CommandPalette {
                 title: commands[*index].title.clone(),
                 description: commands[*index].description.clone(),
                 shortcut: commands[*index].shortcut.clone(),
-                title_color: None,
+                ..Row::default()
             })
             .collect();
         let view = View {
             hint: "Execute a command…",
             empty: "nothing matches",
             footnote: None,
-            description_kept: Kept::Start,
+            label: None,
+            highlight_shown: true,
         };
-        self.show_rows(ctx, &rows, &view, &mut ())
+        self.show_rows(ctx, &rows, Kept::Start, &view, &mut ())
             .map(|row| commands[matches[row]].id.clone())
     }
 
     /// Draw the palette over `rows`, which are listed as given: the caller has already
-    /// searched them for what is typed. The place in `rows` of the one chosen.
+    /// searched them for what is typed. `description_kept` is which end of a row's second
+    /// line is kept when it is too long for the row. The place in `rows` of the one chosen.
     pub fn show_rows(
         &mut self,
         ctx: &egui::Context,
         rows: &[Row],
+        description_kept: Kept,
         view: &View,
         accessory: &mut impl LineAccessory,
     ) -> Option<usize> {
+        let bare = Section {
+            header: None,
+            rows,
+            description_kept,
+            placeholders: 0,
+        };
+        self.show_sections(ctx, &[bare], view, accessory).chosen
+    }
+
+    /// The same over rows in sections, listed as given, one under the other. The keyboard
+    /// walks the rows of every section as one list, skipping the headers and placeholders.
+    pub fn show_sections(
+        &mut self,
+        ctx: &egui::Context,
+        sections: &[Section],
+        view: &View,
+        accessory: &mut impl LineAccessory,
+    ) -> Shown {
         if !self.open {
-            return None;
+            return Shown::default();
         }
         if self.dismissal_requested(ctx) {
             self.dismiss();
-            return None;
+            return Shown::default();
         }
+        // Drawn again after this, if they still are.
+        self.beside.clear();
+        let row_count: usize = sections.iter().map(|section| section.rows.len()).sum();
+        let placeholder_count: usize = sections.iter().map(|section| section.placeholders).sum();
 
         let (move_down, move_up, accept) = ctx.input_mut(|input| {
             (
@@ -194,8 +299,8 @@ impl CommandPalette {
             self.highlighted = 0;
             self.highlight_query.clone_from(&self.query);
         }
-        if !rows.is_empty() {
-            let last = rows.len() - 1;
+        if row_count > 0 {
+            let last = row_count - 1;
             if move_down {
                 self.highlighted = (self.highlighted + 1).min(last);
             }
@@ -204,14 +309,15 @@ impl CommandPalette {
             }
             self.highlighted = self.highlighted.min(last);
         }
+        let picked = self.pick_with_arrows(ctx, sections, row_count);
 
-        let mut chosen = accept
-            .then_some(self.highlighted)
-            .filter(|_| !rows.is_empty());
+        let mut chosen = accept.then_some(self.highlighted).filter(|_| row_count > 0);
+        let mut more_clicked = None;
+        let mut choice_clicked = None;
         let screen = ctx.viewport_rect();
         let area = egui::Area::new("command-palette".into())
             .order(egui::Order::Foreground)
-            .anchor(Align2::CENTER_TOP, vec2(0.0, screen.height() * 0.12))
+            .anchor(Align2::CENTER_TOP, vec2(0.0, screen.height() * TOP_OF_SCREEN))
             .show(ctx, |ui| {
                 frame(&self.style).show(ui, |ui| {
                     ui.set_width(frame_width(screen));
@@ -221,12 +327,27 @@ impl CommandPalette {
                         (f32::from(LINE_PADDING) + accessory.room_at_end(ui)).ceil() as i32,
                     )
                     .expect("the line's accessory is wider than a line's margin can be");
+                    // And at its start for the label, which is drawn in that room.
+                    let label = view.label.map(|label| {
+                        ui.painter().layout_no_wrap(
+                            label.to_string(),
+                            egui::FontId::proportional(self.style.detail_size),
+                            self.style.accent,
+                        )
+                    });
+                    let line_start = match &label {
+                        Some(label) => i8::try_from(
+                            (f32::from(LINE_PADDING) + label.size().x + LABEL_GAP).ceil() as i32,
+                        )
+                        .expect("the line's label is wider than a line's margin can be"),
+                        None => LINE_PADDING,
+                    };
                     let entry = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
                             .hint_text(view.hint)
                             .desired_width(f32::INFINITY)
                             .margin(egui::Margin {
-                                left: LINE_PADDING,
+                                left: line_start,
                                 right: line_end,
                                 top: 5,
                                 bottom: 5,
@@ -236,10 +357,20 @@ impl CommandPalette {
                     if std::mem::take(&mut self.select_query) {
                         select_all(ui.ctx(), entry.id, &self.query);
                     }
+                    if std::mem::take(&mut self.caret_to_end) {
+                        select_from(ui.ctx(), entry.id, &self.query, self.query.chars().count());
+                    }
+                    if let Some(label) = label {
+                        let at = egui::pos2(
+                            entry.rect.min.x + f32::from(LINE_PADDING),
+                            entry.rect.center().y - label.size().y / 2.0,
+                        );
+                        ui.painter().galley(at, label, self.style.accent);
+                    }
                     accessory.show(ui, entry.rect);
 
                     ui.add_space(6.0);
-                    if rows.is_empty() {
+                    if row_count == 0 && placeholder_count == 0 {
                         ui.label(RichText::new(view.empty).color(self.style.muted));
                         return;
                     }
@@ -256,35 +387,49 @@ impl CommandPalette {
                     // a pointer left resting over the list would otherwise take it back from
                     // the first row on every key typed, a frame after it was drawn there.
                     let pointer_moved = ui.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
-                    let height = rows_height(
-                        rows.len(),
-                        self.style.row_height,
-                        ui.spacing().item_spacing.y,
-                    )
-                    .min(screen.height() * ROWS_HEIGHT_OF_SCREEN);
+                    let height =
+                        sections_height(sections, &self.style, ui.spacing().item_spacing.y)
+                            .min(screen.height() * ROWS_HEIGHT_OF_SCREEN);
                     egui::ScrollArea::vertical()
                         .id_salt("command-palette-results")
                         .max_height(height)
                         .min_scrolled_height(height)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for (index, row) in rows.iter().enumerate() {
-                                let highlighted = index == self.highlighted;
-                                let response = draw_row(
-                                    ui,
-                                    row,
-                                    view.description_kept,
-                                    highlighted,
-                                    &self.style,
-                                );
-                                if highlighted && keep_highlight_in_view {
-                                    response.scroll_to_me(None);
+                            // The row's place among the rows of every section.
+                            let mut index = 0;
+                            for (at, section) in sections.iter().enumerate() {
+                                if let Some(header) = &section.header {
+                                    if draw_header(ui, header, &self.style) {
+                                        more_clicked = Some(at);
+                                    }
                                 }
-                                if response.clicked() {
-                                    chosen = Some(index);
+                                for row in section.rows {
+                                    let highlighted =
+                                        view.highlight_shown && index == self.highlighted;
+                                    let (response, clicked) = draw_row(
+                                        ui,
+                                        row,
+                                        section.description_kept,
+                                        highlighted,
+                                        &self.style,
+                                    );
+                                    if highlighted && keep_highlight_in_view {
+                                        response.scroll_to_me(None);
+                                    }
+                                    if response.clicked() {
+                                        chosen = Some(index);
+                                    }
+                                    if let Some(choice) = clicked {
+                                        choice_clicked = Some((index, choice));
+                                    }
+                                    if response.hovered() && pointer_moved {
+                                        self.highlighted = index;
+                                    }
+                                    index += 1;
                                 }
-                                if response.hovered() && pointer_moved {
-                                    self.highlighted = index;
+                                for _ in 0..section.placeholders {
+                                    draw_placeholder(ui, &self.style);
                                 }
                             }
                         });
@@ -299,10 +444,59 @@ impl CommandPalette {
             });
         self.rect = Some(area.response.rect);
 
-        if chosen.is_some() {
+        let stays_open = chosen.is_some_and(|index| {
+            sections
+                .iter()
+                .flat_map(|section| section.rows)
+                .nth(index)
+                .expect("the row chosen is one of the rows")
+                .stays_open
+        });
+        if (chosen.is_some() && !stays_open) || choice_clicked.is_some() {
             self.dismiss();
         }
-        chosen
+        Shown {
+            chosen,
+            more_clicked,
+            picked,
+            choice_clicked,
+        }
+    }
+
+    /// ← and → on a highlighted row with choices: the choice beside the picked one, wrapping
+    /// round, by the row's place and its own. Taken out of the input, so the caret of the
+    /// query line stays where it is. On any other row they are the query line's.
+    fn pick_with_arrows(
+        &self,
+        ctx: &egui::Context,
+        sections: &[Section],
+        row_count: usize,
+    ) -> Option<(usize, usize)> {
+        if row_count == 0 {
+            return None;
+        }
+        let row = sections
+            .iter()
+            .flat_map(|section| section.rows)
+            .nth(self.highlighted)
+            .expect("the highlight is on one of the rows");
+        let count = row.choices.len();
+        if count == 0 {
+            return None;
+        }
+        let (left, right) = ctx.input_mut(|input| {
+            (
+                input.consume_key(Modifiers::NONE, Key::ArrowLeft),
+                input.consume_key(Modifiers::NONE, Key::ArrowRight),
+            )
+        });
+        let to = match (left, right) {
+            (true, false) => (row.picked + count - 1) % count,
+            (false, true) => (row.picked + 1) % count,
+            _ => return None,
+        };
+        ctx.request_repaint();
+        Some((self.highlighted, to))
     }
 }
 
@@ -348,13 +542,19 @@ pub fn pressed_outside(ctx: &egui::Context, drawn_at: Option<egui::Rect>) -> boo
 
 /// Select the whole of the palette's line.
 fn select_all(ctx: &egui::Context, id: egui::Id, query: &str) {
+    select_from(ctx, id, query, 0);
+}
+
+/// Select the palette's line from the character at `from` to its end: from its end is only
+/// the caret, there.
+fn select_from(ctx: &egui::Context, id: egui::Id, query: &str, from: usize) {
     let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
         return;
     };
     state
         .cursor
         .set_char_range(Some(egui::text::CCursorRange::two(
-            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(from),
             egui::text::CCursor::new(query.chars().count()),
         )));
     state.store(ctx, id);
@@ -396,8 +596,46 @@ mod tests {
 
     #[test]
     fn three_rows_want_the_gaps_between_them() {
-        assert_eq!(rows_height(3, 34.0, 4.0), 3.0 * 34.0 + 8.0);
-        assert_eq!(rows_height(1, 34.0, 4.0), 34.0);
-        assert_eq!(rows_height(0, 34.0, 4.0), 0.0);
+        let style = PaletteStyle {
+            row_height: 34.0,
+            header_height: 30.0,
+            ..PaletteStyle::default()
+        };
+        let rows = vec![Row::default(); 3];
+        let bare = |count: usize| Section {
+            header: None,
+            rows: &rows[..count],
+            description_kept: Kept::Start,
+            placeholders: 0,
+        };
+        assert_eq!(sections_height(&[bare(3)], &style, 4.0), 3.0 * 34.0 + 8.0);
+        assert_eq!(sections_height(&[bare(1)], &style, 4.0), 34.0);
+        assert_eq!(sections_height(&[bare(0)], &style, 4.0), 0.0);
+    }
+
+    /// A header and its placeholders take their room as rows do, gaps and all.
+    #[test]
+    fn headers_and_placeholders_count_in_the_height() {
+        let style = PaletteStyle {
+            row_height: 34.0,
+            header_height: 30.0,
+            ..PaletteStyle::default()
+        };
+        let rows = vec![Row::default(); 1];
+        let section = Section {
+            header: Some(SectionHeader {
+                label: "files",
+                count: "1…",
+                busy: true,
+                more: None,
+            }),
+            rows: &rows,
+            description_kept: Kept::End,
+            placeholders: 2,
+        };
+        assert_eq!(
+            sections_height(&[section], &style, 4.0),
+            30.0 + 3.0 * 34.0 + 3.0 * 4.0
+        );
     }
 }
