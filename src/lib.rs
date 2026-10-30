@@ -6,7 +6,7 @@ mod rows;
 mod sections;
 mod style;
 
-use egui::{vec2, Align2, CornerRadius, Key, Modifiers, RichText, Stroke};
+use egui::{vec2, Align2, CornerRadius, Key, RichText, Stroke};
 
 use rows::draw_row;
 use sections::{draw_header, draw_placeholder, sections_height};
@@ -79,11 +79,8 @@ pub struct Shown {
     pub chosen: Option<usize>,
     /// The section whose header's right side was clicked, by its place in the list.
     pub more_clicked: Option<usize>,
-    /// A row's choice picked with ← or →: the row's place among the rows of every section,
-    /// and the choice's among the row's - see [`Row::choices`]. The caller keeps it, and
-    /// lists the row with it picked from the next frame on, which is asked for.
-    pub picked: Option<(usize, usize)>,
-    /// A row's choice clicked, which runs the row with it, the same way.
+    /// A row's choice clicked, which runs the row with it: the row's place among the rows of
+    /// every section, and the choice's among the row's - see [`Row::choices`].
     pub choice_clicked: Option<(usize, usize)>,
 }
 
@@ -102,6 +99,11 @@ pub struct CommandPalette {
     beside: Vec<egui::Rect>,
     /// The row the history box last kept in view - see [`CommandPalette::show_history`].
     history_in_view: Option<usize>,
+    /// The tallest the list has been since something was typed, which it does not go below
+    /// until the query is emptied: a list that shrank and grew as each key changed what
+    /// matched would move every row under the eye. The whole list shown for an empty query
+    /// is not counted, or what is typed would sit over an empty box that tall.
+    list_height_kept: f32,
 }
 
 impl Default for CommandPalette {
@@ -117,6 +119,7 @@ impl Default for CommandPalette {
             style: PaletteStyle::default(),
             beside: Vec::new(),
             history_in_view: None,
+            list_height_kept: 0.0,
         }
     }
 }
@@ -132,6 +135,7 @@ impl CommandPalette {
         self.select_query = false;
         self.beside.clear();
         self.history_in_view = None;
+        self.list_height_kept = 0.0;
     }
 
     /// Open it on a query to type over: it is selected, so the first key typed replaces it.
@@ -309,7 +313,6 @@ impl CommandPalette {
             }
             self.highlighted = self.highlighted.min(last);
         }
-        let picked = self.pick_with_arrows(ctx, sections, row_count);
 
         let mut chosen = accept.then_some(self.highlighted).filter(|_| row_count > 0);
         let mut more_clicked = None;
@@ -371,7 +374,11 @@ impl CommandPalette {
 
                     ui.add_space(6.0);
                     if row_count == 0 && placeholder_count == 0 {
-                        ui.label(RichText::new(view.empty).color(self.style.muted));
+                        let kept = self.list_height_kept;
+                        ui.allocate_ui(vec2(ui.available_width(), kept), |ui| {
+                            ui.set_min_height(kept);
+                            ui.label(RichText::new(view.empty).color(self.style.muted));
+                        });
                         return;
                     }
 
@@ -387,52 +394,57 @@ impl CommandPalette {
                     // a pointer left resting over the list would otherwise take it back from
                     // the first row on every key typed, a frame after it was drawn there.
                     let pointer_moved = ui.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
-                    let height =
-                        sections_height(sections, &self.style, ui.spacing().item_spacing.y)
-                            .min(screen.height() * ROWS_HEIGHT_OF_SCREEN);
+                    let gap = ui.spacing().item_spacing.y;
+                    let typed = !self.query.trim().is_empty();
+                    if !typed {
+                        self.list_height_kept = 0.0;
+                    }
+                    let height = sections_height(sections, &self.style, gap)
+                        .max(self.list_height_kept)
+                        .min(screen.height() * ROWS_HEIGHT_OF_SCREEN);
+                    if typed {
+                        self.list_height_kept = height;
+                    }
+                    let style = &self.style;
+                    let highlighted_now = &mut self.highlighted;
+                    // The row's place among the rows of every section.
+                    let mut index = 0;
+                    let mut draw_sections = |ui: &mut egui::Ui, sections: &[Section]| {
+                        for (at, section) in sections.iter().enumerate() {
+                            if let Some(header) = &section.header {
+                                if draw_header(ui, header, style) {
+                                    more_clicked = Some(at);
+                                }
+                            }
+                            for row in section.rows {
+                                let highlighted = view.highlight_shown && index == *highlighted_now;
+                                let (response, clicked) =
+                                    draw_row(ui, row, section.description_kept, highlighted, style);
+                                if highlighted && keep_highlight_in_view {
+                                    response.scroll_to_me(None);
+                                }
+                                if response.clicked() {
+                                    chosen = Some(index);
+                                }
+                                if let Some(choice) = clicked {
+                                    choice_clicked = Some((index, choice));
+                                }
+                                if response.hovered() && pointer_moved {
+                                    *highlighted_now = index;
+                                }
+                                index += 1;
+                            }
+                            for _ in 0..section.placeholders {
+                                draw_placeholder(ui, style);
+                            }
+                        }
+                    };
                     egui::ScrollArea::vertical()
                         .id_salt("command-palette-results")
                         .max_height(height)
                         .min_scrolled_height(height)
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            // The row's place among the rows of every section.
-                            let mut index = 0;
-                            for (at, section) in sections.iter().enumerate() {
-                                if let Some(header) = &section.header {
-                                    if draw_header(ui, header, &self.style) {
-                                        more_clicked = Some(at);
-                                    }
-                                }
-                                for row in section.rows {
-                                    let highlighted =
-                                        view.highlight_shown && index == self.highlighted;
-                                    let (response, clicked) = draw_row(
-                                        ui,
-                                        row,
-                                        section.description_kept,
-                                        highlighted,
-                                        &self.style,
-                                    );
-                                    if highlighted && keep_highlight_in_view {
-                                        response.scroll_to_me(None);
-                                    }
-                                    if response.clicked() {
-                                        chosen = Some(index);
-                                    }
-                                    if let Some(choice) = clicked {
-                                        choice_clicked = Some((index, choice));
-                                    }
-                                    if response.hovered() && pointer_moved {
-                                        self.highlighted = index;
-                                    }
-                                    index += 1;
-                                }
-                                for _ in 0..section.placeholders {
-                                    draw_placeholder(ui, &self.style);
-                                }
-                            }
-                        });
+                        .show(ui, |ui| draw_sections(ui, sections));
                     if let Some(footnote) = view.footnote {
                         ui.label(
                             RichText::new(footnote)
@@ -458,45 +470,8 @@ impl CommandPalette {
         Shown {
             chosen,
             more_clicked,
-            picked,
             choice_clicked,
         }
-    }
-
-    /// ← and → on a highlighted row with choices: the choice beside the picked one, wrapping
-    /// round, by the row's place and its own. Taken out of the input, so the caret of the
-    /// query line stays where it is. On any other row they are the query line's.
-    fn pick_with_arrows(
-        &self,
-        ctx: &egui::Context,
-        sections: &[Section],
-        row_count: usize,
-    ) -> Option<(usize, usize)> {
-        if row_count == 0 {
-            return None;
-        }
-        let row = sections
-            .iter()
-            .flat_map(|section| section.rows)
-            .nth(self.highlighted)
-            .expect("the highlight is on one of the rows");
-        let count = row.choices.len();
-        if count == 0 {
-            return None;
-        }
-        let (left, right) = ctx.input_mut(|input| {
-            (
-                input.consume_key(Modifiers::NONE, Key::ArrowLeft),
-                input.consume_key(Modifiers::NONE, Key::ArrowRight),
-            )
-        });
-        let to = match (left, right) {
-            (true, false) => (row.picked + count - 1) % count,
-            (false, true) => (row.picked + 1) % count,
-            _ => return None,
-        };
-        ctx.request_repaint();
-        Some((self.highlighted, to))
     }
 }
 
