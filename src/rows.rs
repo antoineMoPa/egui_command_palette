@@ -55,6 +55,10 @@ pub struct Row {
     /// Whether running the row leaves the palette open: a row whose result is shown beside
     /// the palette rather than somewhere it puts the palette away for.
     pub stays_open: bool,
+    /// Whether Enter runs the row only once an arrow key or the pointer has put the highlight
+    /// on it: a row that does something hard to take back, like starting an agent, is not
+    /// run by Enter for being the first of the list. A click runs it all the same.
+    pub needs_reaching: bool,
 }
 
 /// A short note on a row's right side, in the detail size.

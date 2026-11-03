@@ -89,6 +89,9 @@ pub struct CommandPalette {
     query: String,
     highlighted: usize,
     highlight_query: String,
+    /// Whether an arrow key or the pointer has moved the highlight since it was last put back
+    /// on the first row - see [`Row::needs_reaching`].
+    reached: bool,
     rect: Option<egui::Rect>,
     select_query: bool,
     /// Set by [`CommandPalette::set_query`], for the next frame to put the caret after it.
@@ -113,6 +116,7 @@ impl Default for CommandPalette {
             query: String::new(),
             highlighted: 0,
             highlight_query: String::new(),
+            reached: false,
             rect: None,
             select_query: false,
             caret_to_end: false,
@@ -131,6 +135,7 @@ impl CommandPalette {
         self.query.clear();
         self.highlighted = 0;
         self.highlight_query.clear();
+        self.reached = false;
         self.rect = None;
         self.select_query = false;
         self.beside.clear();
@@ -192,6 +197,7 @@ impl CommandPalette {
     /// Back to the first row, as when the list underneath is a different one.
     pub fn highlight_first(&mut self) {
         self.highlighted = 0;
+        self.reached = false;
     }
 
     /// Put the highlight on the row at `index` among the rows about to be shown: the same
@@ -301,20 +307,36 @@ impl CommandPalette {
         let retyped = self.highlight_query != self.query;
         if retyped {
             self.highlighted = 0;
+            self.reached = false;
             self.highlight_query.clone_from(&self.query);
         }
+        let row_at = |index: usize| {
+            sections
+                .iter()
+                .flat_map(|section| section.rows)
+                .nth(index)
+                .expect("the highlight is on one of the rows")
+        };
         if row_count > 0 {
             let last = row_count - 1;
-            if move_down {
+            self.highlighted = self.highlighted.min(last);
+            // On a row still to be reached, the first ↓ reaches it rather than leaving it.
+            let waiting = !self.reached && row_at(self.highlighted).needs_reaching;
+            if move_down && !waiting {
                 self.highlighted = (self.highlighted + 1).min(last);
             }
-            if move_up {
+            if move_up && !waiting {
                 self.highlighted = self.highlighted.saturating_sub(1);
             }
-            self.highlighted = self.highlighted.min(last);
+            if move_down || (move_up && !waiting) {
+                self.reached = true;
+            }
         }
+        let waiting = row_count > 0 && !self.reached && row_at(self.highlighted).needs_reaching;
 
-        let mut chosen = accept.then_some(self.highlighted).filter(|_| row_count > 0);
+        let mut chosen = accept
+            .then_some(self.highlighted)
+            .filter(|_| row_count > 0 && !waiting);
         let mut more_clicked = None;
         let mut choice_clicked = None;
         let screen = ctx.viewport_rect();
@@ -407,6 +429,7 @@ impl CommandPalette {
                     }
                     let style = &self.style;
                     let highlighted_now = &mut self.highlighted;
+                    let reached_now = &mut self.reached;
                     // The row's place among the rows of every section.
                     let mut index = 0;
                     let mut draw_sections = |ui: &mut egui::Ui, sections: &[Section]| {
@@ -417,7 +440,9 @@ impl CommandPalette {
                                 }
                             }
                             for row in section.rows {
-                                let highlighted = view.highlight_shown && index == *highlighted_now;
+                                let highlighted = view.highlight_shown
+                                    && index == *highlighted_now
+                                    && (*reached_now || !row.needs_reaching);
                                 let (response, clicked) =
                                     draw_row(ui, row, section.description_kept, highlighted, style);
                                 if highlighted && keep_highlight_in_view {
@@ -431,6 +456,7 @@ impl CommandPalette {
                                 }
                                 if response.hovered() && pointer_moved {
                                     *highlighted_now = index;
+                                    *reached_now = true;
                                 }
                                 index += 1;
                             }
