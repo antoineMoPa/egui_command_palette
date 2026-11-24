@@ -342,7 +342,10 @@ impl CommandPalette {
         let screen = ctx.viewport_rect();
         let area = egui::Area::new("command-palette".into())
             .order(egui::Order::Foreground)
-            .anchor(Align2::CENTER_TOP, vec2(0.0, screen.height() * TOP_OF_SCREEN))
+            .anchor(
+                Align2::CENTER_TOP,
+                vec2(0.0, screen.height() * TOP_OF_SCREEN),
+            )
             .show(ctx, |ui| {
                 frame(&self.style).show(ui, |ui| {
                     ui.set_width(frame_width(screen));
