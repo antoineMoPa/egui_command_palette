@@ -59,6 +59,9 @@ pub struct Row {
     /// on it: a row that does something hard to take back, like starting an agent, is not
     /// run by Enter for being the first of the list. A click runs it all the same.
     pub needs_reaching: bool,
+    /// Said in a tooltip while the pointer rests on the row - what the row has no room to
+    /// write, like where on disk the file it names is. Empty is no tooltip.
+    pub hover: String,
 }
 
 /// A short note on a row's right side, in the detail size.
@@ -192,6 +195,11 @@ pub(crate) fn draw_row(
     let (rect, response) =
         ui.allocate_exact_size(vec2(width, style.row_height), egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let response = if row.hover.is_empty() {
+        response
+    } else {
+        response.on_hover_text(&row.hover)
+    };
     let mut choice_clicked = None;
 
     if ui.is_rect_visible(rect) {
